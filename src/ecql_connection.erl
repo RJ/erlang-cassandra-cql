@@ -4,6 +4,7 @@
 
 %% API
 -export([start_link/0,
+         start_link/1,
         q/2, q/3
     ]).
 
@@ -27,6 +28,7 @@
 -record(state, {
             host,
             port,
+            creds = [],
             sock,
             caller,
             buffer = <<>>
@@ -46,7 +48,10 @@
 %% @end
 %%--------------------------------------------------------------------
 start_link() ->
-        gen_fsm:start_link({local, ?SERVER}, ?MODULE, ["localhost",?DEFAULT_PORT], []).
+    start_link([]).
+
+start_link(Opts) ->
+    gen_fsm:start_link(?MODULE, [Opts], []).
 
 q(Pid, Query) -> q(Pid, Query, any).
 
@@ -71,32 +76,22 @@ q(Pid, Query, ConsistencyLevel) when is_pid(Pid) ->
 %%                     {stop, StopReason}
 %% @end
 %%--------------------------------------------------------------------
-init([Host, Port]) ->
+init([Opts]) ->
+    Host  = read_opt(host, Opts, "localhost"),
+    Port  = read_opt(port, Opts, ?DEFAULT_PORT),
+    Creds = read_opt(credentials, Opts, []),
     {ok, Sock} = connect_sock(Host, Port),
-    State = #state{ host=Host, port=Port, sock=Sock },
-    %% send STARTUP frame:
-    StartupFrame = #frame{
-        opcode = ?OP_STARTUP,
-        body = ecql_parser:encode_string_map([{<<"CQL_VERSION">>,?CQL_VERSION}])
-    },
-    sock_send(Sock, StartupFrame),
-    {ok, connecting, State}.
+    case auth_connection(Sock, Creds) of
+        ok ->
+            inet:setopts(Sock, [{active, once}]),
+            State = #state{ host=Host, port=Port, sock=Sock, creds=Creds },
+            {ok, ready, State};
+        Err ->
+            {stop, Err}
+    end.
 
-
-connect_sock(Host,Port) ->
-    Opts = [
-        {active, true},
-        {packet, raw},
-        binary,
-        {nodelay, true}
-    ],
-    gen_tcp:connect(Host, Port, Opts).
-
-sock_send(Sock, F=#frame{}) ->
-    io:format("sock_send: ~p\n",[F]),
-    Enc = ecql_parser:encode(F),
-    io:format("SEND: ~p\n",[iolist_to_binary(Enc)]),
-    gen_tcp:send(Sock, Enc).
+read_opt(Key, Opts, Def) ->
+    proplists:get_value(Key, Opts, Def).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -202,11 +197,11 @@ handle_sync_event(_Event, _From, StateName, State) ->
 handle_info({tcp, Sock, Data}, St, State = #state{sock=Sock, buffer=Buffer}) ->
     case ecql_parser:read_frame(<< Buffer/binary, Data/binary >>) of
         {continue, NewBuf} ->
-            %inet:set_opts(Sock, [{active, once}]),
+            inet:setopts(Sock, [{active, once}]),
             {next_state, St, State#state{buffer=NewBuf}};
         {F=#frame{}, NewBuf} ->
             io:format("got frame: ~p\n",[F]),
-            %inet:set_opts(Sock, [{active, once}]),
+            inet:setopts(Sock, [{active, once}]),
             handle_frame(St, F, State#state{buffer=NewBuf})
     end;
 
@@ -250,7 +245,15 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-format_error(Code, Msg, Rest) ->
+sock_send(Sock, F=#frame{}) ->
+    io:format("sock_send: ~p\n",[F]),
+    Enc = ecql_parser:encode(F),
+    io:format("SEND: ~p\n",[iolist_to_binary(Enc)]),
+    gen_tcp:send(Sock, Enc).
+
+
+parse_error_body(<< Code:?int,Body/binary >>) ->
+    {Msg, Rest} = ecql_parser:consume_string(Body),
     {Code, Msg, Rest}.
 
 handle_frame(connecting, #frame{opcode=?OP_READY}, State = #state{}) ->
@@ -259,9 +262,8 @@ handle_frame(connecting, #frame{opcode=?OP_CREDENTIALS}, State = #state{}) ->
     throw({todo, send_credentials}),
     {next_state, ready, State};
 
-handle_frame(awaiting_reply, #frame{opcode=?OP_ERROR, body = <<Code:?int,Body/binary>> }, State = #state{}) ->
-    {Msg, Rest} = ecql_parser:consume_string(Body),
-    Reply = {error, format_error(Code,Msg,Rest)},
+handle_frame(awaiting_reply, #frame{opcode=?OP_ERROR, body = Body}, State = #state{}) ->
+    Reply = {error, parse_error_body(Body)},
     {next_state, ready, send_reply(Reply, State)};
 
 handle_frame(awaiting_reply, #frame{opcode=?OP_RESULT, body = <<Kind:?int,Body/binary>> }, State = #state{}) ->
@@ -306,3 +308,76 @@ handle_frame(St, F, State) ->
 send_reply(Reply, State = #state{caller=From}) when From =/= undefined ->
     gen_fsm:reply(From, Reply),
     State#state{caller=undefined}.
+
+
+
+
+%% Blocking operations used to initially connect and auth the socket
+%% so we can fail from init/1 if no authenticated connection is possible.
+
+connect_sock(Host,Port) ->
+    Opts = [
+        {active, false},
+        {packet, raw},
+        binary,
+        {nodelay, true}
+    ],
+    gen_tcp:connect(Host, Port, Opts).
+
+%% Reads one frame when socket in active=false
+sync_read_frame(Sock) ->
+    {ok, Header} = gen_tcp:recv(Sock, 8),
+    case Header of
+        <<  Ver:8,
+            Flags:8,
+            Stream:8,
+            Opcode:8/integer,
+            Len:?int >> ->
+
+            {ok, Body} = case Len of
+                0 -> {ok, <<>>};
+                _ -> gen_tcp:recv(Sock, Len)
+            end,
+            #frame{
+                type = 1,
+                version = Ver band 128,
+                flags = Flags,
+                stream = Stream,
+                opcode = Opcode,
+                length = Len,
+                body = Body
+            }
+    end.
+
+
+auth_connection(Sock, Creds) ->
+    %% send STARTUP frame:
+    StartupFrame = #frame{
+        opcode = ?OP_STARTUP,
+        body = ecql_parser:encode_string_map([{<<"CQL_VERSION">>,?CQL_VERSION}])
+    },
+    sock_send(Sock, StartupFrame),
+    %% Now we expect either READY or AUTHENTICATE
+    case sync_read_frame(Sock) of
+        #frame{opcode=?OP_ERROR, body=Body} ->
+            {connect_error, parse_error_body(Body)};
+        #frame{opcode=?OP_READY} -> 
+            ok;
+        #frame{opcode=?OP_AUTHENTICATE, body=Body} ->
+            {IAuthenticator,_} = ecql_parser:consume_string(Body),
+            io:format("Asked to authenticate using: ~s\n",[IAuthenticator]),
+            CredBody = ecql_parser:encode_string_map(Creds),
+            CredF = #frame{
+                opcode=?OP_CREDENTIALS,
+                body=CredBody
+            },
+            sock_send(Sock, CredF),
+            %% Now our creds are accepted and we get READY, hopefully..
+            case sync_read_frame(Sock) of
+                #frame{opcode=?OP_ERROR, body=Body} ->
+                    {auth_error, parse_error_body(Body)};
+                #frame{opcode=?OP_READY} -> 
+                    ok
+            end
+    end.
+
