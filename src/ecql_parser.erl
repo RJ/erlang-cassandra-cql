@@ -255,6 +255,74 @@ encode_consistency(all)         -> << ?CONSISTENCY_ALL:?short >>;
 encode_consistency(local_quorum)-> << ?CONSISTENCY_LOCAL_QUORUM:?short >>;
 encode_consistency(each_quorum) -> << ?CONSISTENCY_EACH_QUORUM:?short >>.
 
+decode_consistency(?CONSISTENCY_ANY)        -> any;
+decode_consistency(?CONSISTENCY_ONE)        -> one;
+decode_consistency(?CONSISTENCY_TWO)        -> two;
+decode_consistency(?CONSISTENCY_THREE)      -> three;
+decode_consistency(?CONSISTENCY_QUORUM)     -> quorum;
+decode_consistency(?CONSISTENCY_ALL)        -> all;
+decode_consistency(?CONSISTENCY_LOCAL_QUORUM) -> local_quorum;
+decode_consistency(?CONSISTENCY_EACH_QUORUM)  -> each_quorum.
+
+
+
+
 binary_to_type(bigint,      <<V:64/big-integer>>) -> V;
 binary_to_type(varchar,     V) -> V;
 binary_to_type(T, _) -> throw({cant_cast_type, T}).
+
+%% returns error atom, or {atom, Fun} to convert rest of ERROR msg body to props
+error_code(16#0000) -> server_error;
+error_code(16#000A) -> protocol_error;
+error_code(16#0100) -> bad_credentials;
+error_code(16#1000) -> {unavailable_exception, 
+     fun(<<Cons:?short,Required:?int,Alive:?int,_/binary>>) ->
+        [   {consistency, decode_consistency(Cons)},
+            {nodes_required, Required},
+            {node_alive, Alive}
+        ]
+     end};
+error_code(16#1001) -> overloaded;
+error_code(16#1002) -> is_bootstrapping;
+error_code(16#1003) -> truncate_error;
+error_code(16#1100) -> {write_timeout,
+     fun(<<Cons:?short,Received:?int,BlockFor:?int,Rest/binary>>) ->
+        {WriteTypeStr, _} = consume_string(Rest),
+        WriteType = case WriteTypeStr of
+            <<"SIMPLE">> -> simple;
+            <<"BATCH">>  -> batch;
+            <<"UNLOGGED_BATCH">> -> unlogged_batch;
+            <<"COUNTER">> -> counter;
+            <<"BATCH_LOG">> -> batch_log
+        end,
+        [   {consistency, decode_consistency(Cons)},
+            {nodes_acked, Received},
+            {node_required, BlockFor},
+            {write_type, WriteType}
+        ]
+     end};
+error_code(16#1200) -> {read_timeout,
+     fun(<<Cons:?short,Received:?int,BlockFor:?int,DataPresent:8,_/binary>>) ->
+        [   {consistency, decode_consistency(Cons)},
+            {nodes_acked, Received},
+            {node_required, BlockFor},
+            {data_present, not DataPresent == 0}
+        ]
+     end};
+error_code(16#2000) -> syntax_error;
+error_code(16#2100) -> unauthorized;
+error_code(16#2200) -> invalid;
+error_code(16#2300) -> config_error;
+error_code(16#2400) -> {already_exists,
+    fun(Bin) ->
+        {Ks, R1} = consume_string(Bin),
+        {Table, _} = consume_string(R1),
+        [{keyspace, Ks}, {table, Table}]
+    end};
+error_code(16#2500) -> {unprepared,
+    fun(Bin) ->
+        {Id,_} = consume_short_bytes(Bin),
+        [{id, Id}]
+    end};
+error_code(_)       -> unknown_error_code.
+

@@ -253,8 +253,12 @@ sock_send(Sock, F=#frame{}) ->
 
 
 parse_error_body(<< Code:?int,Body/binary >>) ->
-    {Msg, Rest} = ecql_parser:consume_string(Body),
-    {Code, Msg, Rest}.
+    case ecql_parser:error_code(Code) of
+        Atom when is_atom(Atom) ->
+            Atom;
+        {Atom, BodyParser} when is_atom(Atom), is_function(BodyParser,1) ->
+            {Atom, BodyParser(Body)}
+    end.
 
 handle_frame(connecting, #frame{opcode=?OP_READY}, State = #state{}) ->
     {next_state, ready, State};
