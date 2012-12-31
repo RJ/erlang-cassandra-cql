@@ -49,6 +49,29 @@ encode(#frame{
      Body
     ].
 
+make_prepare_frame(Query0) ->
+    Query = fixup_query(Query0),
+    B = [
+        encode_long_string(Query)
+    ],
+    #frame{
+        opcode = ?OP_PREPARE,
+        body = B
+    }.
+
+make_execute_frame(Qid, Params, Consistency) ->
+    QidLen = size(Qid),
+    NumParams = length(Params),
+    B = [
+        <<QidLen:?short, Qid/binary>>,
+        <<NumParams:?short>>,
+        [val_encode_bytes(V) || V <- Params],
+        encode_consistency(Consistency)
+    ],
+    #frame{
+        opcode = ?OP_EXECUTE,
+        body = B
+    }.
 
 make_query_frame(Query0, Consistency) ->
     Query = fixup_query(Query0),
@@ -64,6 +87,19 @@ make_query_frame(Query0, Consistency) ->
 %% TODO utf conversion for binary
 fixup_query(Q) when is_list(Q) -> list_to_binary(Q);
 fixup_query(Q) when is_binary(Q) -> Q.
+
+encode_bytes(B) when is_binary(B) ->
+    L = size(B),
+    << L:?int, B/binary >>.
+
+val_encode_bytes({bytes, V}) -> encode_bytes(V);
+val_encode_bytes({text,  V}) -> encode_bytes(V);
+val_encode_bytes({_,     V}) -> encode_bytes(V);
+%% Infer types when unspecified:
+val_encode_bytes(Num) when is_integer(Num) -> val_encode_bytes({int,Num});
+val_encode_bytes(Bin) when is_binary(Bin)  -> val_encode_bytes({text,Bin});
+val_encode_bytes(E) -> throw({unknown_val_type, E}).
+
 
 
 encode_string_map(L) ->

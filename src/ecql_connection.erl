@@ -3,9 +3,13 @@
 -include("ecql.hrl").
 
 %% API
--export([start_link/0,
-         start_link/1,
-        q/2, q/3
+-export([
+        start_link/0
+    ,   start_link/1
+    ,   q/2
+    ,   q/3
+    ,   prepare/2
+    ,   execute/4
     ]).
 
 %% gen_fsm callbacks
@@ -17,13 +21,13 @@
          handle_info/3,
          terminate/3,
          code_change/4]).
-
+%% fsm state exports
 -export([
     ready/3
     ]).
 
 -define(SERVER, ?MODULE).
--define(DEFAULT_PORT, 9042).
+-define(DEFAULT_PORT, 9042). %% native proto, not thrift
 
 -record(state, {
             host,
@@ -53,11 +57,16 @@ start_link() ->
 start_link(Opts) ->
     gen_fsm:start_link(?MODULE, [Opts], []).
 
-q(Pid, Query) -> q(Pid, Query, any).
+q(Pid, Query) -> q(Pid, Query, one).
 
 q(Pid, Query, ConsistencyLevel) when is_pid(Pid) ->
     gen_fsm:sync_send_event(Pid, {q, Query, ConsistencyLevel}).
 
+prepare(Pid, Query) ->
+    gen_fsm:sync_send_event(Pid, {prepare, Query}).
+
+execute(Pid, Qid, Params, ConsistencyLevel) ->
+    gen_fsm:sync_send_event(Pid, {execute, Qid, Params, ConsistencyLevel}).
 
 %%%===================================================================
 %%% gen_fsm callbacks
@@ -130,6 +139,18 @@ state_name(_Event, State) ->
 %% @end
 %%--------------------------------------------------------------------
 
+ready({prepare, Query}, From, State = #state{sock=Sock}) ->
+    F = ecql_parser:make_prepare_frame(Query),
+    sock_send(Sock, F),
+    NewState = State#state{caller=From},
+    {next_state, awaiting_reply, NewState};
+
+ready({execute, Qid, Params, ConsistencyLevel}, From, State = #state{sock=Sock}) ->
+    F = ecql_parser:make_execute_frame(Qid, Params, ConsistencyLevel),
+    sock_send(Sock, F),
+    NewState = State#state{caller=From},
+    {next_state, awaiting_reply, NewState};
+
 ready({q, Query, Consistency}, From, State = #state{sock=Sock}) ->
     F = ecql_parser:make_query_frame(Query,Consistency),
     sock_send(Sock, F),
@@ -200,7 +221,7 @@ handle_info({tcp, Sock, Data}, St, State = #state{sock=Sock, buffer=Buffer}) ->
             inet:setopts(Sock, [{active, once}]),
             {next_state, St, State#state{buffer=NewBuf}};
         {F=#frame{}, NewBuf} ->
-            io:format("got frame: ~p\n",[F]),
+            %io:format("got frame: ~p\n",[F]),
             inet:setopts(Sock, [{active, once}]),
             handle_frame(St, F, State#state{buffer=NewBuf})
     end;
@@ -246,9 +267,9 @@ code_change(_OldVsn, StateName, State, _Extra) ->
 %%%===================================================================
 
 sock_send(Sock, F=#frame{}) ->
-    io:format("sock_send: ~p\n",[F]),
+    %io:format("sock_send: ~p\n",[F]),
     Enc = ecql_parser:encode(F),
-    io:format("SEND: ~p\n",[iolist_to_binary(Enc)]),
+    %io:format("SEND: ~p\n",[iolist_to_binary(Enc)]),
     gen_tcp:send(Sock, Enc).
 
 
