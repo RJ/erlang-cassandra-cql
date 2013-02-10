@@ -244,10 +244,16 @@ consume_num_rows(N, MD, Bin, Acc) ->
     consume_num_rows(N-1, MD, Rest, [Fields|Acc]).
 
 consume_columns(_MD, 0, Rest, _ColPos, Acc) -> {lists:reverse(Acc), Rest};
-consume_columns(MD, N, <<Len:?int,Bytes:Len/binary-unit:8, Rest/binary>>, ColPos, Acc) when N > 0 ->
+consume_columns(MD, N, <<Len:?int, Rest/binary>>, ColPos, Acc) when N > 0 ->
     {ColType,_ColName} = element(ColPos, MD#metadata.columns),
-    Val = column_bytes_to_type(ColType, Bytes),
-    consume_columns(MD, N-1, Rest, ColPos + 1, [Val | Acc]).
+    case Len =:= -1 of
+        true -> 
+            consume_columns(MD, N-1, Rest, ColPos + 1, [null | Acc]);
+        false ->
+            <<Bytes:Len/binary-unit:8, Bin/binary>> = Rest,
+            Val = column_bytes_to_type(ColType, Bytes),
+            consume_columns(MD, N-1, Bin, ColPos + 1, [Val | Acc])
+    end.
 
 %% TODO check what format stuff is, like what's a counter, etc?
 column_bytes_to_type({custom, _}, Bytes) -> Bytes;
